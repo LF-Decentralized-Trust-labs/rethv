@@ -1,0 +1,23 @@
+[package]
+name = "prova-evm-guest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sp1-zkvm = "6.8.0"
+prova-common = { path = "../common" }
+revm = { version = "38.0.0", default-features = false, features = [
+    "optional_balance_check",
+    "optional_block_gas_limit",
+    "optional_fee_charge",
+    "optional_no_base_fee",
+] }
+
+[workspace]
+
+# SP1's sha3 runs the permutation as the keccak precompile; revm hashes
+# through alloy-primitives, which uses sha3 on this target. Its sha2 hashes
+# the public values with the SHA-256 precompiles.
+[patch.crates-io]
+sha3 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha3-0.11.0-sp1-6.0.0" }
+sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", tag = "patch-sha2-0.10.9-sp1-6.0.0", package = "sha2" }

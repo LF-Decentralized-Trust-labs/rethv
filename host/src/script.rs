@@ -1,0 +1,254 @@
+//! Test scripts (`tests/*.test`): steps, each followed by indented
+//! expectations about its result.
+//!
+//! ```text
+//! contract contracts/incrementer.sol     # read by ./prova, ignored here
+//! deploy 5
+//!     storage 0x0 = 5
+//! get()
+//!     returns 5
+//! nope()
+//!     reverts
+//! ```
+//!
+//! A step must succeed unless it is followed by `reverts`.
+
+use crate::{
+    account, default_context, hex, keccak256, parse_address, parse_step, parse_word, set_option,
+    short, short_address, Step,
+};
+use prova_common::Address;
+use prova_common::{Public, Word};
+
+pub struct Case {
+    pub line: usize,
+    pub step: Step,
+    pub reverts: bool,
+    pub expect: Vec<Expect>,
+}
+
+pub enum Expect {
+    /// The exact output bytes: `returns WORD...` or `output 0xHEX`.
+    Output(Vec<u8>),
+    /// `storage [ADDRESS] SLOT = VALUE` after the step, in the account at
+    /// ADDRESS (default: the step's `--to`); 0 also matches a missing slot.
+    Storage(Address, Word, Word),
+    /// `syscall NAME COUNT`: how often a precompile ran, e.g. `KECCAK_PERMUTE`.
+    Syscall(String, u64),
+    /// `logs N`: the number of events.
+    Logs(usize),
+    /// `log [SIGNATURE] TOPIC... [data WORD...]`: the next event. A signature
+    /// like `Transfer(address,address,uint256)` stands for its keccak256.
+    Log(Vec<Word>, Vec<u8>),
+}
+
+pub fn parse(text: &str) -> Result<Vec<Case>, String> {
+    let mut cases: Vec<Case> = Vec::new();
+    // A line of options only, like `--from 0xa11ce --to 0xb`, sets them for
+    // the steps after it.
+    let mut defaults = default_context();
+
+    for (i, raw) in text.lines().enumerate() {
+        let line = i + 1;
+        let content = raw.split('#').next().unwrap().trim_end();
+        if content.trim().is_empty() {
+            continue;
+        }
+        let at = |err: String| format!("line {line}: {err}");
+
+        if !content.starts_with(char::is_whitespace) {
+            if content.starts_with("contract ") || content.starts_with("solang ") {
+                continue;
+            }
+            let tokens: Vec<&str> = content.split_whitespace().collect();
+            if tokens.len().is_multiple_of(2)
+                && tokens.iter().step_by(2).all(|t| t.starts_with("--"))
+            {
+                for pair in tokens.chunks(2) {
+                    if !set_option(&mut defaults, pair[0], pair[1]).map_err(at)? {
+                        return Err(at(format!("unknown option `{}`", pair[0])));
+                    }
+                }
+                continue;
+            }
+            cases.push(Case {
+                line,
+                step: parse_step(content, &defaults).map_err(at)?,
+                reverts: false,
+                expect: Vec::new(),
+            });
+            continue;
+        }
+
+        let case = cases
+            .last_mut()
+            .ok_or_else(|| at("an expectation needs a step above it".into()))?;
+        let tokens = crate::abi::tokenize(content).map_err(at)?;
+        let mut words = tokens.iter().map(String::as_str);
+        match words.next().unwrap() {
+            "reverts" => case.reverts = true,
+            "returns" => {
+                let values = crate::abi::parse_values(words).map_err(at)?;
+                case.expect
+                    .push(Expect::Output(crate::abi::encode(&values)));
+            }
+            "output" => {
+                let bytes = words.next().unwrap_or("");
+                let digits = bytes
+                    .strip_prefix("0x")
+                    .filter(|d| d.len() % 2 == 0)
+                    .ok_or_else(|| {
+                        at(format!(
+                            "`{bytes}` is not 0x and an even number of hex digits"
+                        ))
+                    })?;
+                let output = (0..digits.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&digits[i..i + 2], 16))
+                    .collect::<Result<_, _>>()
+                    .map_err(|err| at(err.to_string()))?;
+                case.expect.push(Expect::Output(output));
+            }
+            // `error "message"`: reverts with Error(string).
+            "error" => {
+                let values = crate::abi::parse_values(words).map_err(at)?;
+                let mut output = vec![0x08, 0xc3, 0x79, 0xa0];
+                output.extend_from_slice(&crate::abi::encode(&values));
+                case.reverts = true;
+                case.expect.push(Expect::Output(output));
+            }
+            "storage" => {
+                let rest: Vec<&str> = words.collect();
+                let (address, slot, value) = match rest[..] {
+                    [slot, "=", value] => (case.step.context.address, slot, value),
+                    [address, slot, "=", value] => {
+                        (parse_address(address).map_err(at)?, slot, value)
+                    }
+                    _ => return Err(at("write `storage [ADDRESS] SLOT = VALUE`".into())),
+                };
+                case.expect.push(Expect::Storage(
+                    address,
+                    parse_word(slot).map_err(at)?,
+                    parse_word(value).map_err(at)?,
+                ));
+            }
+            "syscall" => {
+                let rest: Vec<&str> = words.collect();
+                let [name, count] = rest[..] else {
+                    return Err(at("write `syscall NAME COUNT`".into()));
+                };
+                let count = count
+                    .parse()
+                    .map_err(|_| at(format!("`{count}` is not a count")))?;
+                case.expect.push(Expect::Syscall(name.to_string(), count));
+            }
+            "logs" => {
+                let count = words.next().unwrap_or("");
+                let count = count
+                    .parse()
+                    .map_err(|_| at(format!("`{count}` is not a count")))?;
+                case.expect.push(Expect::Logs(count));
+            }
+            "log" => {
+                let (mut topics, mut data, mut in_data) = (Vec::new(), Vec::new(), false);
+                for word in words {
+                    if word == "data" {
+                        in_data = true;
+                    } else if in_data {
+                        data.push(crate::abi::parse_value(word).map_err(at)?);
+                    } else if word.contains('(') {
+                        topics.push(keccak256(word.as_bytes()));
+                    } else {
+                        topics.push(parse_word(word).map_err(at)?);
+                    }
+                }
+                case.expect
+                    .push(Expect::Log(topics, crate::abi::encode(&data)));
+            }
+            other => return Err(at(format!("unknown expectation `{other}`"))),
+        }
+    }
+    Ok(cases)
+}
+
+/// Every way the result differs from what the case expects.
+pub fn check(case: &Case, public: &Public, syscalls: &[(String, u64)]) -> Vec<String> {
+    let mut failures = Vec::new();
+    if public.reverted != case.reverts {
+        failures.push(format!(
+            "expected {}, but it {}",
+            if case.reverts { "a revert" } else { "success" },
+            if public.reverted {
+                "reverted"
+            } else {
+                "succeeded"
+            }
+        ));
+    }
+    // `log` lines list the events in order, and imply their count.
+    let mut next_log = 0;
+    let expected_logs = case
+        .expect
+        .iter()
+        .filter(|e| matches!(e, Expect::Log(..)))
+        .count();
+    if expected_logs > 0 && expected_logs != public.logs.len() {
+        failures.push(format!(
+            "{} events, expected {expected_logs}",
+            public.logs.len()
+        ));
+    }
+    for expect in &case.expect {
+        match expect {
+            Expect::Logs(count) if *count != public.logs.len() => {
+                failures.push(format!("{} events, expected {count}", public.logs.len()))
+            }
+            Expect::Log(topics, data) => {
+                if let Some(log) = public.logs.get(next_log) {
+                    if log.topics != *topics || log.data != *data {
+                        let show = |topics: &[Word], data: &[u8]| {
+                            let topics: Vec<_> = topics.iter().map(short).collect();
+                            format!("[{}] 0x{}", topics.join(", "), hex(data))
+                        };
+                        failures.push(format!(
+                            "event {next_log} is {}, expected {}",
+                            show(&log.topics, &log.data),
+                            show(topics, data)
+                        ));
+                    }
+                }
+                next_log += 1;
+            }
+            Expect::Output(output) if *output != public.output => failures.push(format!(
+                "output is 0x{}, expected 0x{}",
+                hex(&public.output),
+                hex(output)
+            )),
+            Expect::Storage(address, slot, value) => {
+                let actual = account(&public.state_after, address)
+                    .and_then(|account| account.storage.iter().find(|(s, _)| s == slot))
+                    .map_or([0; 32], |(_, v)| *v);
+                if actual != *value {
+                    failures.push(format!(
+                        "storage {} {} is {}, expected {}",
+                        short_address(address),
+                        short(slot),
+                        short(&actual),
+                        short(value)
+                    ));
+                }
+            }
+            Expect::Syscall(name, count) => {
+                let actual = syscalls
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map_or(0, |(_, c)| *c);
+                if actual != *count {
+                    failures.push(format!("{name} ran {actual} times, expected {count}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    failures
+}
